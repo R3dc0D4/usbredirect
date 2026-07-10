@@ -3,3 +3,6 @@ usbredirect
 *.dll
 *.so
 *.dylib
+usbredirect
+usbredirect-*.exe
+usbredirect-*

@@ -5,12 +5,16 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
+	"strings"
+	"time"
 
 	"github.com/r3dc0d4/usbredirect/internal/serial"
+	"github.com/r3dc0d4/usbredirect/internal/virtual"
 )
 
 // runServerTCP starts a raw TCP server that bridges serial port data.
-// Multiple clients can connect; data from serial is broadcast to all clients,
+// Supports multiple clients — serial data is broadcast to all clients,
 // and data from any client is written to serial.
 func (a *Agent) runServerTCP(serialPort *serial.Port) error {
 	listener, err := net.Listen("tcp", a.cfg.Network.Listen)
@@ -57,7 +61,11 @@ func (a *Agent) runServerTCP(serialPort *serial.Port) error {
 		}
 	}()
 
-	a.logger.Info("USB redirect server ready", "serial", serialPort.Name(), "listen", a.cfg.Network.Listen)
+	a.logger.Info("USB redirect server ready",
+		"serial", serialPort.Name(),
+		"listen", a.cfg.Network.Listen,
+		"hint", "Connect with: usbredirect agent --mode client --remote <server-ip>"+a.cfg.Network.Listen,
+	)
 
 	for {
 		select {
@@ -102,55 +110,157 @@ func (a *Agent) runServerTCP(serialPort *serial.Port) error {
 	}
 }
 
-// runClientTCP connects to a remote TCP server and creates a virtual serial port (PTY on Linux/macOS).
+// runClientTCP connects to a remote TCP server and creates a virtual serial port.
 func (a *Agent) runClientTCP() error {
 	a.logger.Info("Connecting to remote server", "addr", a.cfg.Network.Remote)
 
-	conn, err := net.Dial("tcp", a.cfg.Network.Remote)
+	// Connect with retry
+	var conn net.Conn
+	var err error
+	maxRetries := 10
+	retryDelay := a.cfg.Server.Reconnect.Initial
+
+	for i := 0; i < maxRetries; i++ {
+		conn, err = net.Dial("tcp", a.cfg.Network.Remote)
+		if err == nil {
+			break
+		}
+		a.logger.Warn("Connection failed, retrying",
+			"attempt", i+1,
+			"error", err,
+			"delay", retryDelay,
+		)
+		time.Sleep(retryDelay)
+		if retryDelay < a.cfg.Server.Reconnect.Max {
+			retryDelay = time.Duration(float64(retryDelay) * a.cfg.Server.Reconnect.Multiplier)
+			if retryDelay > a.cfg.Server.Reconnect.Max {
+				retryDelay = a.cfg.Server.Reconnect.Max
+			}
+		}
+	}
 	if err != nil {
-		return fmt.Errorf("failed to connect to %s: %w", a.cfg.Network.Remote, err)
+		return fmt.Errorf("failed to connect after %d retries: %w", maxRetries, err)
 	}
 	defer conn.Close()
 
 	a.logger.Info("Connected to remote server", "addr", conn.RemoteAddr())
 
-	// TODO: Create virtual COM port
-	// On Linux/macOS: PTY
-	// On Windows: Named pipe or kernel driver
-	// For MVP: just bridge stdin/stdout or create a PTY
+	// Create virtual COM port
+	virtualPort := a.cfg.Virtual.Port
+	if virtualPort == "" {
+		// Auto-generate a PTY (Linux/macOS) or named pipe (Windows)
+		virtualPort = "" // Let Create() decide
+	}
 
-	a.logger.Info("Bridging network to virtual port (MVP: using PTY/stdout)")
+	vp, err := virtual.Create(virtualPort)
+	if err != nil {
+		return fmt.Errorf("failed to create virtual port: %w", err)
+	}
+	defer vp.Close()
 
-	// Simple bidirectional copy for MVP
+	a.logger.Info("Virtual serial port created", "port", vp.PortName())
+	fmt.Printf("\n╔══════════════════════════════════════════════════╗\n")
+	fmt.Printf("║  USB Redirect Client - CONNECTED                ║\n")
+	fmt.Printf("║  Remote: %-38s  ║\n", a.cfg.Network.Remote)
+	fmt.Printf("║  Virtual Port: %-32s  ║\n", vp.PortName())
+	fmt.Printf("║  Connect your software to this port.              ║\n")
+	fmt.Printf("║  Press Ctrl+C to disconnect.                    ║\n")
+	fmt.Printf("╚══════════════════════════════════════════════════╝\n\n")
+
+	// Bridge: Virtual port <-> TCP connection
 	done := make(chan error, 2)
 
-	// Network → Serial (stdout for MVP)
+	// Virtual port (PTY master) -> TCP
+	// Note: PTY Read() returns EIO when no slave is open; we retry.
 	go func() {
-		_, err := io.Copy(osStdout{}, conn)
-		done <- err
+		buf := make([]byte, 4096)
+		for {
+			n, err := vp.Read(buf)
+			if err != nil {
+				if err == io.EOF {
+					a.logger.Info("Virtual port closed (EOF)")
+					done <- nil
+					return
+				}
+				// EIO (input/output error) happens when no slave has PTY open yet
+				// Retry with backoff until an application opens the virtual port
+				if isRetryableError(err) {
+					a.logger.Debug("Waiting for application to open virtual port...")
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				a.logger.Error("Virtual port read error", "error", err)
+				done <- fmt.Errorf("virtual read: %w", err)
+				return
+			}
+			if n > 0 {
+				if _, err := conn.Write(buf[:n]); err != nil {
+					done <- fmt.Errorf("tcp write: %w", err)
+					return
+				}
+				a.logger.Info("Virtual→TCP", "bytes", n)
+			}
+		}
 	}()
 
-	// Serial (stdin for MVP) → Network
+	// TCP -> Virtual port (PTY master)
 	go func() {
-		_, err := io.Copy(conn, osStdin{})
-		done <- err
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				if err == io.EOF {
+					a.logger.Info("Connection closed by remote")
+					done <- nil
+					return
+				}
+				a.logger.Error("TCP read error", "error", err)
+				done <- fmt.Errorf("tcp read: %w", err)
+				return
+			}
+			if n > 0 {
+				if _, err := vp.Write(buf[:n]); err != nil {
+					done <- fmt.Errorf("virtual write: %w", err)
+					return
+				}
+				a.logger.Info("TCP→Virtual", "bytes", n)
+			}
+		}
 	}()
 
-	err = <-done
-	a.logger.Info("Connection closed", "error", err)
-	return nil
+	// Wait for completion or signal
+	select {
+	case err := <-done:
+		if err != nil {
+			a.logger.Error("Bridge error", "error", err)
+		}
+		return err
+	case sig := <-waitForSignalChan():
+		a.logger.Info("Received signal, shutting down", "signal", sig)
+		return nil
+	}
 }
 
-// osStdout wraps os.Stdout to implement io.Writer
-type osStdout struct{}
-
-func (osStdout) Write(p []byte) (int, error) {
-	return os.Stdout.Write(p)
+// waitForSignalChan returns a channel that receives OS signals.
+func waitForSignalChan() <-chan os.Signal {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	return ch
 }
 
-// osStdin wraps os.Stdin to implement io.Reader
-type osStdin struct{}
+// Placeholder for future Tether integration
+// serial and config packages are used in other files in this package
+var _ = io.EOF
 
-func (osStdin) Read(p []byte) (int, error) {
-	return os.Stdin.Read(p)
+// isRetryableError checks if the error is a temporary condition that can be retried.
+// On Linux, PTY Read() returns EIO when no slave is open.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for "input/output error" (EIO) which happens when
+	// no application has opened the PTY slave yet
+	return err.Error() == "read /dev/ptmx: input/output error" ||
+		strings.Contains(err.Error(), "input/output error") ||
+		strings.Contains(err.Error(), "I/O error")
 }

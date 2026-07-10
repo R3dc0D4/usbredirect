@@ -2,13 +2,16 @@ package agent
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/r3dc0d4/usbredirect/internal/config"
 	"github.com/r3dc0d4/usbredirect/internal/serial"
+	"github.com/r3dc0d4/usbredirect/internal/virtual"
 )
 
 // Agent is the main USB redirect agent.
@@ -51,9 +54,6 @@ func (a *Agent) runServer() error {
 	if err != nil {
 		return err
 	}
-
-
-	// Open serial port
 	dataBits, err := serial.ParseDataBits(a.cfg.Serial.DataBits)
 	if err != nil {
 		return err
@@ -116,6 +116,114 @@ func ListPorts() error {
 		fmt.Printf("  %s\n", p)
 	}
 	return nil
+}
+
+// bridgeSerialTCP bridges a serial port and a TCP connection bidirectionally.
+func bridgeSerialTCP(serialPort *serial.Port, conn net.Conn, logger *slog.Logger, done chan error) {
+	// Serial → TCP
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := serialPort.Read(buf)
+			if err != nil {
+				logger.Error("Serial read error", "error", err)
+				done <- fmt.Errorf("serial read: %w", err)
+				return
+			}
+			if n > 0 {
+				if _, err := conn.Write(buf[:n]); err != nil {
+					logger.Error("TCP write error", "error", err)
+					done <- fmt.Errorf("tcp write: %w", err)
+					return
+				}
+				logger.Debug("Serial→TCP", "bytes", n)
+			}
+		}
+	}()
+
+	// TCP → Serial
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					logger.Error("TCP read error", "error", err)
+				}
+				done <- fmt.Errorf("tcp read: %w", err)
+				return
+			}
+			if n > 0 {
+				if _, err := serialPort.Write(buf[:n]); err != nil {
+					logger.Error("Serial write error", "error", err)
+					done <- fmt.Errorf("serial write: %w", err)
+					return
+				}
+				logger.Debug("TCP→Serial", "bytes", n)
+			}
+		}
+	}()
+}
+
+// bridgeVirtualTCP bridges a virtual port and a TCP connection bidirectionally.
+// The virtual port uses PTY master; data written to the PTY master appears on
+// the PTY slave (which is the virtual COM port that applications connect to),
+// and vice versa.
+func bridgeVirtualTCP(vPort *virtual.VirtualPort, conn net.Conn, logger *slog.Logger, done chan error) {
+	// Virtual port (PTY master) → TCP
+	// When an application opens the PTY slave and writes data,
+	// it becomes readable on the PTY master.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := vPort.Read(buf)
+			if err != nil {
+				// EIO is expected when no slave has the PTY open
+				if err == io.EOF {
+					logger.Info("Virtual port closed (EOF)")
+					done <- nil
+					return
+				}
+				logger.Error("Virtual port read error", "error", err)
+				done <- fmt.Errorf("virtual read: %w", err)
+				return
+			}
+			if n > 0 {
+				if _, err := conn.Write(buf[:n]); err != nil {
+					logger.Error("TCP write error", "error", err)
+					done <- fmt.Errorf("tcp write: %w", err)
+					return
+				}
+				logger.Debug("Virtual→TCP", "bytes", n)
+			}
+		}
+	}()
+
+	// TCP → Virtual port (PTY master)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				if err == io.EOF {
+					logger.Info("Connection closed by remote")
+					done <- nil
+					return
+				}
+				logger.Error("TCP read error", "error", err)
+				done <- fmt.Errorf("tcp read: %w", err)
+				return
+			}
+			if n > 0 {
+				if _, err := vPort.Write(buf[:n]); err != nil {
+					logger.Error("Virtual port write error", "error", err)
+					done <- fmt.Errorf("virtual write: %w", err)
+					return
+				}
+				logger.Debug("TCP→Virtual", "bytes", n)
+			}
+		}
+	}()
 }
 
 // waitForSignal blocks until a termination signal is received.
