@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	go_serial "go.bug.st/serial"
+
 	"github.com/r3dc0d4/usbredirect/internal/serial"
 	"github.com/r3dc0d4/usbredirect/internal/tether"
 	"github.com/r3dc0d4/usbredirect/internal/virtual"
@@ -33,12 +35,44 @@ func (a *Agent) runServerTether(serialPort *serial.Port) error {
 		switch msg.SubType {
 		case "set_baud":
 			if baud, ok := msg.Value.(float64); ok {
-				a.logger.Info("Reconfiguring baud rate", "baud", int(baud))
-				// TODO: implement serial port reconfiguration
+				a.logger.Info("RFC 2217: Reconfiguring baud rate", "baud", int(baud))
+				parity, _ := serial.ParseParity(a.cfg.Serial.Parity)
+				dataBits, _ := serial.ParseDataBits(a.cfg.Serial.DataBits)
+				stopBits, _ := serial.ParseStopBits(a.cfg.Serial.StopBits)
+				if err := serialPort.Reconfigure(int(baud), dataBits, parity, stopBits); err != nil {
+					a.logger.Error("RFC 2217: Failed to reconfigure baud", "error", err)
+				}
 			}
-		case "set_parity", "set_databits", "set_stopbits", "set_flowcontrol":
-			a.logger.Info("Serial control message", "subType", msg.SubType, "value", msg.Value)
-			// TODO: implement RFC 2217 control
+		case "set_parity":
+			if parity, ok := msg.Value.(string); ok {
+				a.logger.Info("RFC 2217: Reconfiguring parity", "parity", parity)
+				p, _ := serial.ParseParity(parity)
+				d, _ := serial.ParseDataBits(a.cfg.Serial.DataBits)
+				s, _ := serial.ParseStopBits(a.cfg.Serial.StopBits)
+				if err := serialPort.Reconfigure(a.cfg.Serial.Baud, d, p, s); err != nil {
+					a.logger.Error("RFC 2217: Failed to reconfigure parity", "error", err)
+				}
+			}
+		case "set_databits":
+			if bits, ok := msg.Value.(float64); ok {
+				a.logger.Info("RFC 2217: Reconfiguring data bits", "bits", int(bits))
+				p, _ := serial.ParseParity(a.cfg.Serial.Parity)
+				s, _ := serial.ParseStopBits(a.cfg.Serial.StopBits)
+				if err := serialPort.Reconfigure(a.cfg.Serial.Baud, int(bits), p, s); err != nil {
+					a.logger.Error("RFC 2217: Failed to reconfigure data bits", "error", err)
+				}
+			}
+		case "set_stopbits":
+			if bits, ok := msg.Value.(float64); ok {
+				a.logger.Info("RFC 2217: Reconfiguring stop bits", "bits", int(bits))
+				p, _ := serial.ParseParity(a.cfg.Serial.Parity)
+				d, _ := serial.ParseDataBits(a.cfg.Serial.DataBits)
+				if err := serialPort.Reconfigure(a.cfg.Serial.Baud, d, p, go_serial.StopBits(int(bits))); err != nil {
+					a.logger.Error("RFC 2217: Failed to reconfigure stop bits", "error", err)
+				}
+			}
+		default:
+			a.logger.Info("RFC 2217 control message", "subType", msg.SubType, "value", msg.Value)
 		}
 	})
 

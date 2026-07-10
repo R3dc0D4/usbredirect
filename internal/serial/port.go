@@ -5,6 +5,8 @@ import (
 	"log/slog"
 
 	go_serial "go.bug.st/serial"
+
+	"github.com/r3dc0d4/usbredirect/internal/protocol"
 )
 
 // Port wraps a serial port with configuration.
@@ -90,8 +92,40 @@ func (p *Port) Reconfigure(baud int, dataBits int, parity go_serial.Parity, stop
 	if err := p.port.SetMode(mode); err != nil {
 		return fmt.Errorf("failed to reconfigure serial port: %w", err)
 	}
-	p.logger.Info("Serial port reconfigured", "baud", baud, "databits", dataBits, "parity", parity, "stopbits", stopBits)
+	// Update stored config
+	p.config.Baud = baud
+	p.config.DataBits = dataBits
+	p.config.Parity = parity
+	p.config.StopBits = stopBits
+	p.logger.Info("Serial port reconfigured", "baud", baud, "databits", dataBits, "parity", fmt.Sprintf("%v", parity), "stopbits", fmt.Sprintf("%v", stopBits))
 	return nil
+}
+
+// ReconfigureFromPortConfig reconfigures the serial port from a PortConfig struct.
+func (p *Port) ReconfigureFromPortConfig(cfg *protocol.PortConfig) error {
+	parity, err := ParseParity(cfg.Parity)
+	if err != nil {
+		return fmt.Errorf("invalid parity: %w", err)
+	}
+	dataBits, err := ParseDataBits(cfg.DataBits)
+	if err != nil {
+		return fmt.Errorf("invalid data bits: %w", err)
+	}
+	stopBits, err := ParseStopBits(cfg.StopBits)
+	if err != nil {
+		return fmt.Errorf("invalid stop bits: %w", err)
+	}
+	return p.Reconfigure(cfg.Baud, dataBits, parity, stopBits)
+}
+
+// PortConfig returns the current port configuration.
+func (p *Port) PortConfig() *protocol.PortConfig {
+	return &protocol.PortConfig{
+		Baud:     p.config.Baud,
+		DataBits: p.config.DataBits,
+		Parity:   protocol.ParityString(int(p.config.Parity)),
+		StopBits: int(p.config.StopBits),
+	}
 }
 
 // ListPorts returns available serial ports.
