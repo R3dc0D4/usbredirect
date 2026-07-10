@@ -1,0 +1,35 @@
+# USB Redirect Configuration Example
+
+# Agent mode: "server" or "client"
+mode: server
+
+# Serial port configuration (server mode)
+serial:
+  port: "/dev/ttyUSB0"   # Linux: /dev/ttyUSB0, Windows: COM3, macOS: /dev/tty.usbserial
+  baud: 9600
+  databits: 8
+  parity: "none"          # none, odd, even, mark, space
+  stopbits: 1
+
+# Virtual COM port configuration (client mode)
+virtual:
+  port: "COM5"            # Windows: COM5, Linux: /dev/ttyV0, macOS: /dev/ttyp0
+
+# Network configuration
+network:
+  listen: ":5760"         # TCP listen address (server mode)
+  remote: ""              # TCP remote address (client mode): host:port
+  tls: false              # Enable TLS
+
+# Tether server configuration (optional, for WebSocket relay)
+server:
+  url: ""                 # Tether server URL: ws://host:port or wss://host:port
+  token: ""              # Authentication token
+  remote_client: ""       # Target client ID (client mode)
+  reconnect:
+    initial: "1s"         # Initial reconnect delay
+    max: "30s"            # Maximum reconnect delay
+    multiplier: 2.0       # Backoff multiplier
+
+# RFC 2217 support (baud rate/parity changes over network)
+rfc2217: false
