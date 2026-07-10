@@ -1,0 +1,5 @@
+usbredirect
+*.exe
+*.dll
+*.so
+*.dylib
